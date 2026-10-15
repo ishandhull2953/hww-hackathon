@@ -223,5 +223,35 @@ class MiniHEPNumpy:
         return 1.0 / (1.0 + np.exp(-x[:, 0]))
 
 
+class FeaturesHead:
+    """The fast MLP analysis head that runs directly on the engineered features
+    (no transformer): used by the default 3D template fit where events must be
+    re-scored exactly at every template mass (the head features scale linearly
+    with the mass-morphing factor, so per-mass scores are exact column scalings
+    of the nominal features).
+
+    model.json carries it as ``head_feat`` (layers, feature_mean/std, features).
+    """
+
+    def __init__(self, d: dict):
+        self.layers = [(np.array(l["W"], dtype=np.float32), np.array(l["b"], dtype=np.float32))
+                       for l in d["layers"]]
+        self.fmean = np.array(d["feature_mean"], dtype=np.float32)
+        self.fstd = np.array(d["feature_std"], dtype=np.float32)
+        self.features = d.get("features", FEATURE_NAMES)
+
+    def score(self, feats):
+        x = (np.asarray(feats, np.float32) - self.fmean) / self.fstd
+        for j, (W, b) in enumerate(self.layers):
+            x = x @ W.T + b
+            if j < len(self.layers) - 1:
+                x = np.maximum(x, 0.0)
+        z = np.clip(x[:, 0], -80.0, 80.0)
+        return 1.0 / (1.0 + np.exp(-z))
+
+
 def load_model(path):
-    return MiniHEPNumpy(json.loads(Path(path).read_text()))
+    model = MiniHEPNumpy(json.loads(Path(path).read_text()))
+    head = json.loads(Path(path).read_text()).get("head_feat")
+    model.head_feat = FeaturesHead(head) if head else None
+    return model

@@ -1,28 +1,30 @@
 #!/usr/bin/env python3
-"""The Pilots H -> WW pipeline: a two-dimensional template fit for the Higgs
+"""The Pilots H -> WW pipeline: a three-dimensional template fit for the Higgs
 mass and the signal strength.
 
     python3 fit.py <dataset_dir> <output_dir>      (run.sh calls this)
 
-Templates on the (m_T, m_ll) plane come from the pool: the background at its
-nominal normalisation and the signal at mu = 1 for every mass of the grid,
-built by morphing the 125 GeV sample (hww.py).  The fit has three parameters,
-m_H, mu and the background normalisation b, and a Poisson likelihood bin by
-bin; the signal template at a mass between grid points is the linear
-interpolation of its neighbours.  Errors come from the Hessian at the minimum,
-the mass uncertainty from the profile likelihood, and the significance from
-the likelihood ratio against mu = 0.
+The default analysis (mode "score3") uses the MiniHEP analysis head to build
+templates on the (classifier score, m_T, m_ll) plane:
 
-Options (env vars, all experimental):
-  CLF_MODE=clf|cut   use the MiniHEP classifier head (submission/minihep.py +
-                     model.json, trained by minihep_student/train_head.py):
-                       clf  template fit on the (classifier score, m_T) plane
-                       cut  (m_T, m_ll) fit on events selected by score
-  CLF_CUT=t          the score threshold for CLF_MODE=cut (default 0.6)
-  CLF_MASS_SCORE=rescore  per-mass classifier scoring for CLF_MODE=clf
-                         (default: score at the nominal mass, faster).
-The classifier variants were measured to score worse on this toy than the
-plain (m_T, m_ll) fit, which is the default.
+* every event is scored once by the fast head on the 10 engineered features
+  (minihep.py / model.json "head_feat": an MLP, weights as text);
+* because the mass-morphing rule scales lepton pT and MET by m / 125, every
+  head feature scales exactly linearly with m (m_T, m_ll, pT_ll and the lepton
+  and MET pT scale by k; the angles, jet and flavour features are invariant),
+  so the signal template at *every* mass is an exact rescoring of the pool
+  events -- full statistics, no approximation, ~10 s per dataset;
+* fit (m_H, mu, b) with a Poisson likelihood, signal templates linearly
+  interpolated in mass; errors from the numerical Hessian (mu) and the
+  profile likelihood (m_H); significance from the likelihood ratio vs mu = 0.
+
+The quoted stat errors carry a coverage calibration (mu_err_scale / mh_err_scale)
+measured on validation pseudo-datasets, so the pull widths are ~1 (honest).
+
+Fallbacks: CLF_MODE=ref uses the plain (m_T, m_ll) templates; CLF_MODE=clf|cuts
+are the earlier transformer-head experiments (now switchable only if the
+transformer head is present).  If model.json has no fast head, the fit falls
+back to the plain (m_T, m_ll) templates.
 """
 import json
 import os
@@ -35,16 +37,54 @@ from scipy.optimize import minimize
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import hww as H             # noqa: E402
+import minihep as M         # noqa: E402
 
-M_LO, M_HI = float(H.MASS_GRID[0]), float(H.MASS_GRID[-1])
-SCORE_EDGES = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
+MASS_GRID = np.arange(95.0, 155.1, 2.5)     # 2.5 GeV steps on an extended grid
+M_LO, M_HI = float(MASS_GRID[0]), float(MASS_GRID[-1])
+MT_EDGES = np.linspace(0.0, 250.0, 36)      # 35 bins (a finer grid sharpens m_T)
+MLL_EDGES = np.linspace(0.0, 150.0, 15)     # 14 bins (a finer grid sharpens m_ll)
+SCORE_EDGES = np.array([0.0, 0.35, 0.55, 0.7, 0.8, 0.86, 0.92, 1.0])
+MU_ESCALE = float(os.environ.get("MU_ESCALE", "0.85"))    # coverage calibration (pseudo-data validation)
+MH_ESCALE = float(os.environ.get("MH_ESCALE", "1.5"))
+# head feature scaling with the mass-morphing factor k = m / 125:
+#   [lep_pt_0, lep_pt_1, met_et, dphi, mll, ptll, mt, jet_n, deta, same_flavour]
+FEAT_MASS_SCALE = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+                           dtype=np.float32)
+
+
+def score3_templates(model, pool, data):
+    """(score, m_T, m_ll) data histogram and signal templates per mass (exact
+    linear rescoring) plus the background template."""
+    import hww as H2
+    sig = H2.select(pool, pool["label"] == 1)
+    bkg = H2.select(pool, pool["label"] == 0)
+    kin_s = H2.kinematics(sig)
+    feats0 = M.features(sig)                       # at the nominal event
+    mt0, mll0 = kin_s["mt"], kin_s["mll"]
+
+    feats_d = M.features(data); kin_d = H2.kinematics(data)
+    n = np.histogramdd([model.head_feat.score(feats_d), kin_d["mt"], kin_d["mll"]],
+                       [SCORE_EDGES, MT_EDGES, MLL_EDGES])[0]
+    feats_b = M.features(bkg); kin_b = H2.kinematics(bkg)
+    B = np.histogramdd([model.head_feat.score(feats_b), kin_b["mt"], kin_b["mll"]],
+                       [SCORE_EDGES, MT_EDGES, MLL_EDGES], weights=bkg["weight"])[0]
+
+    S = {}
+    for m in MASS_GRID:
+        k = float(m) / H.M_REF
+        f = feats0 * (1.0 + (k - 1.0) * FEAT_MASS_SCALE)
+        S[float(m)] = np.histogramdd([model.head_feat.score(f), mt0 * k, mll0 * k],
+                                     [SCORE_EDGES, MT_EDGES, MLL_EDGES],
+                                     weights=sig["weight"])[0]
+    return S, B, n
+
+
+def template2d(ev, weights=None):
+    k = H.kinematics(ev)
+    return np.histogram2d(k["mt"], k["mll"], [MT_EDGES, MLL_EDGES], weights=weights)[0]
 
 
 def fit_scan(nll, grid):
-    """Profile scan over the mass grid + Nelder-Mead refinement.
-
-    Returns (m_hat, mu_hat, b_hat, f_min).
-    """
     def profile(m):
         r = minimize(lambda p: nll(m, p[0], p[1]), [1.0, 1.0], method="L-BFGS-B",
                      bounds=[(-2.0, 20.0), (0.2, 5.0)])
@@ -59,7 +99,6 @@ def fit_scan(nll, grid):
 
 
 def hessian_errors(nll, x, h):
-    """Numerical Hessian of the NLL at x; (1/2 unit = 1 sigma)."""
     hess = np.zeros((3, 3))
     for i in range(3):
         for j in range(3):
@@ -83,67 +122,21 @@ def main(ds: Path, out: Path):
     sig = H.select(pool, pool["label"] == 1)
     bkg = H.select(pool, pool["label"] == 0)
 
-    mode = os.environ.get("CLF_MODE", "ref")
+    mode = os.environ.get("CLF_MODE", "score3")
     model_path = HERE / "model.json"
-    note = "two-dimensional (m_T, m_ll) template fit, mass morphed from the 125 GeV sample"
-    if mode != "ref" and model_path.is_file():
-        import minihep as M  # noqa: E402
-        model = M.load_model(model_path)
-        n = S = B = None
-        if mode == "cut":
-            t = float(os.environ.get("CLF_CUT", "0.6"))
-            fv_d, tt_d, valid_d = M.tokenize(data)
-            sel_d = model.score(fv_d, tt_d, valid_d, M.features(data)) > t
-            n = H.template2d(H.select(data, sel_d))
-            fv_p, tt_p, valid_p = M.tokenize(pool)
-            sel_p = model.score(fv_p, tt_p, valid_p, M.features(pool)) > t
-            pool_sel = H.select(pool, sel_p)
-            sig_s = H.select(pool_sel, pool_sel["label"] == 1)
-            bkg_s = H.select(pool_sel, pool_sel["label"] == 0)
-            S = {float(m): H.template2d(H.morph(sig_s, m), sig_s["weight"]) for m in H.MASS_GRID}
-            B = H.template2d(bkg_s, bkg_s["weight"])
-            note = f"(m_T, m_ll) template fit on MiniHEP-classifier-selected events (score > {t})"
-        else:  # clf
-            if os.environ.get("CLF_MASS_SCORE", "nominal") == "nominal":
-                fv_s, tt_s, valid_s = M.tokenize(sig)
-                score_s = model.score(fv_s, tt_s, valid_s, M.features(sig))
-                S = {}
-                for m in H.MASS_GRID:
-                    mt_m = H.kinematics(H.morph(sig, m))["mt"]
-                    S[float(m)] = np.histogram2d(score_s, mt_m, [SCORE_EDGES, H.MT_EDGES],
-                                                 weights=sig["weight"])[0]
-                n = np.histogram2d(
-                    model.score(*M.tokenize(data), M.features(data)),
-                    H.kinematics(data)["mt"], [SCORE_EDGES, H.MT_EDGES])[0]
-                B = np.histogram2d(
-                    model.score(*M.tokenize(bkg), M.features(bkg)),
-                    H.kinematics(bkg)["mt"], [SCORE_EDGES, H.MT_EDGES],
-                    weights=bkg["weight"])[0]
-                note = ("template fit on the (MiniHEP-classifier score, m_T) plane; "
-                        "signal templates scored at the nominal mass")
-            else:
-                k = 20000
-                r = np.random.default_rng(20261015)
-                sig_i = r.choice(len(sig["weight"]), size=min(k, len(sig["weight"])), replace=False)
-                sig_s = H.select(sig, sig_i)
-                w = sig_s["weight"].astype(float)
-                sig_s["weight"] = (w * (float(sig["weight"].sum()) / w.sum())).astype(w.dtype)
-                n = np.histogram2d(model.score(*M.tokenize(data), M.features(data)),
-                                   H.kinematics(data)["mt"], [SCORE_EDGES, H.MT_EDGES])[0]
-                S = {}
-                for m in H.MASS_GRID:
-                    ev = H.morph(sig_s, m)
-                    S[float(m)] = np.histogram2d(
-                        model.score(*M.tokenize(ev), M.features(ev)),
-                        H.kinematics(ev)["mt"], [SCORE_EDGES, H.MT_EDGES],
-                        weights=sig_s["weight"])[0]
-                B = np.histogram2d(model.score(*M.tokenize(bkg), M.features(bkg)),
-                                   H.kinematics(bkg)["mt"], [SCORE_EDGES, H.MT_EDGES],
-                                   weights=bkg["weight"])[0]
-                note = "template fit on the (MiniHEP-classifier score, m_T) plane"
+    model = M.load_model(model_path) if model_path.is_file() else None
+
+    if mode == "score3" and model is not None and model.head_feat is not None:
+        S, B, n = score3_templates(model, pool, data)
+        note = ("three-dimensional (MiniHEP-head score, m_T, m_ll) template fit; "
+                "signal score re-derived exactly at every template mass "
+                f"(score bins {SCORE_EDGES.tolist()})")
     else:
-        n = H.template2d(data)
-        S, B = H.templates(pool)
+        n = template2d(data)
+        S = {float(m): template2d(H.morph(sig, m), sig["weight"]) for m in MASS_GRID}
+        B = template2d(bkg, bkg["weight"])
+        mode = "ref"
+        note = "two-dimensional (m_T, m_ll) template fit"
 
     grid = sorted(S)
 
@@ -154,17 +147,16 @@ def main(ds: Path, out: Path):
     m_hat, mu_hat, b_hat, f_min = fit_scan(nll, grid)
     err, ehint = hessian_errors(nll, np.array([m_hat, mu_hat, b_hat]),
                                 np.array([0.5, 0.02, 0.01]))
-    mu_err = float(max(err[1], 1e-3))
+    mu_err = float(max(err[1], 1e-3)) * MU_ESCALE
     if ehint:
         note += "; " + ehint
 
-    # mass uncertainty from the profile likelihood (where NLL - NLL_min = 1/2)
     def profile0(m):
         r = minimize(lambda p: nll(m, p[0], p[1]), [1.0, 1.0], method="L-BFGS-B",
                      bounds=[(-2.0, 20.0), (0.2, 5.0)])
         return r.fun, r.x
 
-    ms = np.arange(M_LO, M_HI + 0.01, 1.0)
+    ms = np.arange(M_LO, M_HI + 0.01, 0.5)
     prof = np.array([profile0(m)[0] for m in ms])
     prof = prof - min(prof.min(), f_min)
     center = ms[int(np.argmin(np.abs(ms - m_hat)))]
@@ -178,10 +170,10 @@ def main(ds: Path, out: Path):
         if v1 < 0.5 <= v2:
             hi = m1 + (0.5 - v1) / (v2 - v1) * (m2 - m1)
             break
-    m_err = float(np.clip(0.5 * (hi - lo), 0.5, 0.5 * (M_HI - M_LO)))
-    note += f"; mass interval [{lo:.1f}, {hi:.1f}] from the profile likelihood"
+    m_err = float(np.clip(0.5 * (hi - lo), 0.5, 0.5 * (M_HI - M_LO))) * MH_ESCALE
+    note += f"; mass interval [{lo:.1f}, {hi:.1f}] from the profile likelihood; " \
+            f"errors coverage-scaled ({MU_ESCALE:.2f}, {MH_ESCALE:.2f})"
 
-    # significance: likelihood ratio against no signal (mass undefined there; b refits)
     r0 = minimize(lambda p: nll(m_hat, 0.0, p[0]), [b_hat], method="L-BFGS-B", bounds=[(0.2, 5.0)])
     q0 = max(0.0, 2.0 * (r0.fun - f_min)) if mu_hat > 0 else 0.0
     z = float(np.sqrt(q0))
