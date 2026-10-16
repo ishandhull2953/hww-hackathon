@@ -44,12 +44,37 @@ M_LO, M_HI = float(MASS_GRID[0]), float(MASS_GRID[-1])
 MT_EDGES = np.linspace(0.0, 250.0, 36)      # 35 bins (a finer grid sharpens m_T)
 MLL_EDGES = np.linspace(0.0, 150.0, 15)     # 14 bins (a finer grid sharpens m_ll)
 SCORE_EDGES = np.array([0.0, 0.35, 0.55, 0.7, 0.8, 0.86, 0.92, 1.0])
+# Optional submission/fit.cfg (JSON) overrides, read at run time (the pool is
+# identical in every dataset, so the result is unchanged between datasets):
+#   {"score_edges": [...], "score_nbins": 8}
+# score_nbins builds signal-weight quantile edges of the pool's score (equal
+# signal weight per bin), which adapts the binning to the head's calibration.
 MU_ESCALE = float(os.environ.get("MU_ESCALE", "0.85"))    # coverage calibration (pseudo-data validation)
 MH_ESCALE = float(os.environ.get("MH_ESCALE", "1.5"))
 # head feature scaling with the mass-morphing factor k = m / 125:
 #   [lep_pt_0, lep_pt_1, met_et, dphi, mll, ptll, mt, jet_n, deta, same_flavour]
 FEAT_MASS_SCALE = np.array([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
                            dtype=np.float32)
+
+
+def weighted_quantiles(x, w, q):
+    """Weighted quantiles of x with weights w (for adaptive score binning)."""
+    o = np.argsort(x)
+    xo, wo = x[o], w[o]
+    cw = np.cumsum(wo)
+    cw = cw / cw[-1]
+    return np.interp(q, cw, xo)
+
+
+def score_edges_for(score_sig, w_sig, cfg):
+    """Score bin edges from submission/fit.cfg; the default is the fixed grid."""
+    if cfg.get("score_edges"):
+        return np.array(cfg["score_edges"], float)
+    nb = int(cfg.get("score_nbins", 0))
+    if nb >= 2:
+        q = np.linspace(0.0, 1.0, nb + 1)[1:-1]
+        return np.concatenate([[0.0], weighted_quantiles(np.asarray(score_sig), w_sig, q), [1.0]])
+    return SCORE_EDGES
 
 
 def score3_templates(model, pool, data):
@@ -62,21 +87,53 @@ def score3_templates(model, pool, data):
     feats0 = M.features(sig)                       # at the nominal event
     mt0, mll0 = kin_s["mt"], kin_s["mll"]
 
+    cfg = {}
+    cfg_path = HERE / "fit.cfg"
+    if cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text())
+
+    # Mass-parametrised head (features + k column)?  Then every event is scored
+    # with its own mass hypothesis: k = 1 for background, k = m/125 for signal.
+    # With score_data_per_m the DATA is also scored under each hypothesis m
+    # (the coherent definition of a mass-parametrised classifier), so the fit
+    # gets a per-mass data histogram n[m].
     feats_d = M.features(data); kin_d = H2.kinematics(data)
-    n = np.histogramdd([model.head_feat.score(feats_d), kin_d["mt"], kin_d["mll"]],
-                       [SCORE_EDGES, MT_EDGES, MLL_EDGES])[0]
     feats_b = M.features(bkg); kin_b = H2.kinematics(bkg)
-    B = np.histogramdd([model.head_feat.score(feats_b), kin_b["mt"], kin_b["mll"]],
-                       [SCORE_EDGES, MT_EDGES, MLL_EDGES], weights=bkg["weight"])[0]
+    use_mk = "k" in (getattr(model.head_feat, "features", []) or [])
+    score_data_per_m = bool(cfg.get("score_data_per_m")) and use_mk
+    if use_mk:
+        score_b = model.head_feat.score(M.features_mk(bkg, 1.0))
+        edge_score = model.head_feat.score(M.features_mk(sig, 1.0))
+    else:
+        score_b = model.head_feat.score(feats_b)
+        edge_score = model.head_feat.score(feats0)
+    score_edges = score_edges_for(edge_score, sig["weight"], cfg)
+
+    if not score_data_per_m:
+        score_d = (model.head_feat.score(M.features_mk(data, 1.0)) if use_mk
+                   else model.head_feat.score(feats_d))
+        n = np.histogramdd([score_d, kin_d["mt"], kin_d["mll"]],
+                           [score_edges, MT_EDGES, MLL_EDGES])[0]
+    else:
+        n = {float(m): np.histogramdd([model.head_feat.score(M.features_mk(data, float(m) / H.M_REF)),
+                                       kin_d["mt"], kin_d["mll"]],
+                                      [score_edges, MT_EDGES, MLL_EDGES])[0]
+             for m in MASS_GRID}
+    B = np.histogramdd([score_b, kin_b["mt"], kin_b["mll"]],
+                       [score_edges, MT_EDGES, MLL_EDGES], weights=bkg["weight"])[0]
 
     S = {}
     for m in MASS_GRID:
         k = float(m) / H.M_REF
         f = feats0 * (1.0 + (k - 1.0) * FEAT_MASS_SCALE)
-        S[float(m)] = np.histogramdd([model.head_feat.score(f), mt0 * k, mll0 * k],
-                                     [SCORE_EDGES, MT_EDGES, MLL_EDGES],
+        if use_mk:
+            s = model.head_feat.score(np.column_stack([f, np.full(len(f), k, np.float32)]))
+        else:
+            s = model.head_feat.score(f)
+        S[float(m)] = np.histogramdd([s, mt0 * k, mll0 * k],
+                                     [score_edges, MT_EDGES, MLL_EDGES],
                                      weights=sig["weight"])[0]
-    return S, B, n
+    return S, B, n, score_edges
 
 
 def template2d(ev, weights=None):
@@ -127,10 +184,10 @@ def main(ds: Path, out: Path):
     model = M.load_model(model_path) if model_path.is_file() else None
 
     if mode == "score3" and model is not None and model.head_feat is not None:
-        S, B, n = score3_templates(model, pool, data)
+        S, B, n, score_edges = score3_templates(model, pool, data)
         note = ("three-dimensional (MiniHEP-head score, m_T, m_ll) template fit; "
                 "signal score re-derived exactly at every template mass "
-                f"(score bins {SCORE_EDGES.tolist()})")
+                f"(score bins {np.round(score_edges, 4).tolist()})")
     else:
         n = template2d(data)
         S = {float(m): template2d(H.morph(sig, m), sig["weight"]) for m in MASS_GRID}
@@ -140,9 +197,12 @@ def main(ds: Path, out: Path):
 
     grid = sorted(S)
 
+    def nm(m):
+        return n if not isinstance(n, dict) else H.interpolate(n, m)
+
     def nll(m, mu, b):
         lam = np.clip(mu * H.interpolate(S, m) + b * B, 1e-9, None)
-        return float(np.sum(lam - n * np.log(lam)))
+        return float(np.sum(lam - nm(m) * np.log(lam)))
 
     m_hat, mu_hat, b_hat, f_min = fit_scan(nll, grid)
     err, ehint = hessian_errors(nll, np.array([m_hat, mu_hat, b_hat]),

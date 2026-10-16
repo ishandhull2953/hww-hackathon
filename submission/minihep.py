@@ -106,6 +106,17 @@ def features(ev):
     return np.column_stack([np.asarray(cols[f], float) for f in FEATURE_NAMES])
 
 
+def features_mk(ev, k=None):
+    """features(ev) with the mass factor k = m / 125 appended as an extra column
+    (a classifier parametrised in the mass hypothesis): the score of a signal of
+    mass m is the head applied to the exactly-scaled features with k as input."""
+    f = features(ev)
+    if k is None:
+        return f
+    kcol = np.full(len(f), float(k), np.float32) if np.isscalar(k) else np.asarray(k, np.float32)
+    return np.column_stack([f, kcol])
+
+
 class MiniHEPNumpy:
     """Forward pass of the trained MiniHEP backbone + analysis head."""
 
